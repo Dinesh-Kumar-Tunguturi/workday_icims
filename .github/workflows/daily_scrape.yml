@@ -1,0 +1,46 @@
+name: US Job Scraper Pipeline
+
+on:
+  schedule:
+    # Every 3 hours
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # Manual trigger from Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # Max 2 hours as per spec
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install httpx beautifulsoup4
+
+    - name: Run Scraper → Direct DB Push
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: python main.py
+
+    - name: Upload CSV artifact (backup)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: scraped-jobs-${{ github.run_number }}
+        path: us_jobs_recent*.csv
+        retention-days: 7
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: scraper-logs-${{ github.run_number }}
+        path: scraper.log
+        retention-days: 7
