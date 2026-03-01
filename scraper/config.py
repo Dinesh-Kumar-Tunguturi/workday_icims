@@ -16,7 +16,7 @@ SEMAPHORE_LIMIT = 20
 PORTAL_CONCURRENCY = 12
 SEARCH_PER_PORTAL = 8
 WD_PAGE_SIZE = 20
-MAX_PAGES_PER_KEYWORD = 5
+MAX_PAGES_PER_KEYWORD = 500
 
 # ─── Timeouts & Retries ───
 REQUEST_TIMEOUT = 25
@@ -30,7 +30,7 @@ LAST_N_HOURS = 24
 PORTALS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "career_links.txt")
 
 # ─── CSV Backup ───
-CSV_OUTPUT = "us_jobs_recent.csv"
+CSV_OUTPUT = "all_jobs_recent.csv"
 
 # ─── User Agent ───
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
