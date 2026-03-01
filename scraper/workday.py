@@ -119,8 +119,6 @@ async def search_and_insert(
                     old_count += 1
                     continue
                 loc = item.get("locationsText", "")
-                if not is_us_location(loc):
-                    continue
 
                 ext = item.get("externalPath", "")
                 job_url = f"https://{portal['domain']}/en-US/{portal['site']}{ext}"
@@ -213,7 +211,7 @@ async def search_and_insert(
 
                 count += 1
 
-            if old_count >= len(postings) * 0.7:
+            if old_count >= len(postings): # Only break if ALL jobs are old, ATS often mix orders
                 break
             if len(postings) < config.WD_PAGE_SIZE:
                 break
@@ -233,4 +231,4 @@ async def process_portal(portal: Dict, search_pairs: List[tuple],
     if total > 0:
         log.info(f"  [WD] {tenant}: {total} jobs ✅")
     else:
-        log.info(f"  [WD] {tenant}: 0 recent US jobs")
+        log.info(f"  [WD] {tenant}: 0 recent jobs")
