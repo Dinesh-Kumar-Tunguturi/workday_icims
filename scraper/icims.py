@@ -110,6 +110,7 @@ async def _search_jibe_api(portal, keyword, domain_name, client, csv_writer) -> 
 
                 data = resp.json()
                 jobs_list = data.get("jobs", [])
+                fetched_count = len(jobs_list)
                 
                 for item in jobs_list:
                     jp = item.get("data", {})
@@ -160,7 +161,7 @@ async def _search_jibe_api(portal, keyword, domain_name, client, csv_writer) -> 
                     await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
         
         count += page_count
-        if page_count == 0 or page_count < 100:
+        if fetched_count == 0 or fetched_count < 100:
             break
         offset += 100
         if offset >= 2000:
@@ -186,6 +187,7 @@ async def _search_modern(portal, keyword, domain_name, client, csv_writer) -> in
 
                 soup = BeautifulSoup(resp.text, "html.parser")
                 tiles = soup.find_all("li", class_=lambda c: c and "job-tile" in c)
+                fetched_count = len(tiles)
                 for tile in tiles:
                     job = _parse_tile(tile, base, domain_name, keyword, company)
                     if not job:
@@ -207,9 +209,9 @@ async def _search_modern(portal, keyword, domain_name, client, csv_writer) -> in
                     await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
         
         count += page_count
-        if page_count == 0:
+        if fetched_count == 0 or fetched_count < 15:
             break
-        startrow += 20  # iCIMS typically uses 20 or 15. We advance by 20 to be safe
+        startrow += fetched_count
         if startrow >= 1000:  # Safety cap
             break
             
@@ -233,12 +235,14 @@ async def _search_legacy(portal, keyword, domain_name, client, csv_writer) -> in
                     break
 
                 soup = BeautifulSoup(resp.text, "html.parser")
+                fetched_count = 0
                 for script in soup.find_all("script", type="application/ld+json"):
                     try:
                         ld = json.loads(script.string)
                         if not isinstance(ld, dict) or ld.get("@type") != "ItemList":
                             continue
                         for item in ld.get("itemListElement", []):
+                            fetched_count += 1
                             jp = item.get("item", item)
                             posted = jp.get("datePosted", "")
                             if not is_recent(posted):
@@ -287,7 +291,7 @@ async def _search_legacy(portal, keyword, domain_name, client, csv_writer) -> in
                     await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
         
         count += page_count
-        if page_count == 0:
+        if fetched_count == 0:
             break
         pr += 1
         if pr > 50:
@@ -301,77 +305,89 @@ async def _search_custom(portal, keyword, domain_name, client, csv_writer) -> in
     final_url = portal.get("final_url", "")
     company = portal["company"]
 
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            resp = await client.get(
-                final_url, params={"q": keyword},
-                headers={"User-Agent": config.USER_AGENT}, follow_redirects=True,
-            )
-            if resp.status_code != 200:
+    pr = 0
+    while True:
+        page_count = 0
+        fetched_count = 0
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                resp = await client.get(
+                    final_url, params={"q": keyword, "pr": pr},
+                    headers={"User-Agent": config.USER_AGENT}, follow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for script in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        ld = json.loads(script.string)
+                        items = []
+                        if isinstance(ld, dict):
+                            if ld.get("@type") == "ItemList":
+                                items = ld.get("itemListElement", [])
+                            elif ld.get("@type") == "JobPosting":
+                                items = [ld]
+                        elif isinstance(ld, list):
+                            items = ld
+
+                        for item in items:
+                            fetched_count += 1
+                            jp = item.get("item", item) if isinstance(item, dict) else item
+                            if not isinstance(jp, dict):
+                                continue
+                            posted = jp.get("datePosted", "")
+                            if not is_recent(posted):
+                                continue
+                            loc = _ld_location(jp)
+
+                            org = jp.get("hiringOrganization", {})
+                            desc = strip_html(jp.get("description", ""))
+
+                            job = {
+                                "domain": domain_name,
+                                "role_searched": keyword,
+                                "source_ats": "icims",
+                                "company": org.get("name", company) if isinstance(org, dict) else company,
+                                "job_id": _ld_id(jp),
+                                "title": jp.get("title", jp.get("name", "")),
+                                "job_url": jp.get("url", ""),
+                                "description": desc,
+                                "location": loc,
+                                "posted_date": posted,
+                                "employment_type": jp.get("employmentType", ""),
+                                "time_type": jp.get("employmentType", ""),
+                                "experience_level": extract_experience(desc) or "Not Specified",
+                                "company_logo": org.get("logo", "") if isinstance(org, dict) else "",
+                                "salary": _ld_salary(jp),
+                                "remote_eligible": "Yes" if "remote" in loc.lower() else "",
+                            }
+
+                            jl = jp.get("jobLocation", {})
+                            if isinstance(jl, dict):
+                                a = jl.get("address", {})
+                                if isinstance(a, dict):
+                                    job["city"] = a.get("addressLocality", "")
+                                    job["state"] = a.get("addressRegion", "")
+                                    job["country"] = a.get("addressCountry", "")
+
+                            result = await db.insert_job(job)
+                            if csv_writer and result != "duplicate":
+                                await csv_writer(job)
+                            page_count += 1
+                    except Exception:
+                        pass
                 break
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    ld = json.loads(script.string)
-                    items = []
-                    if isinstance(ld, dict):
-                        if ld.get("@type") == "ItemList":
-                            items = ld.get("itemListElement", [])
-                        elif ld.get("@type") == "JobPosting":
-                            items = [ld]
-                    elif isinstance(ld, list):
-                        items = ld
-
-                    for item in items:
-                        jp = item.get("item", item) if isinstance(item, dict) else item
-                        if not isinstance(jp, dict):
-                            continue
-                        posted = jp.get("datePosted", "")
-                        if not is_recent(posted):
-                            continue
-                        loc = _ld_location(jp)
-
-                        org = jp.get("hiringOrganization", {})
-                        desc = strip_html(jp.get("description", ""))
-
-                        job = {
-                            "domain": domain_name,
-                            "role_searched": keyword,
-                            "source_ats": "icims",
-                            "company": org.get("name", company) if isinstance(org, dict) else company,
-                            "job_id": _ld_id(jp),
-                            "title": jp.get("title", jp.get("name", "")),
-                            "job_url": jp.get("url", ""),
-                            "description": desc,
-                            "location": loc,
-                            "posted_date": posted,
-                            "employment_type": jp.get("employmentType", ""),
-                            "time_type": jp.get("employmentType", ""),
-                            "experience_level": extract_experience(desc) or "Not Specified",
-                            "company_logo": org.get("logo", "") if isinstance(org, dict) else "",
-                            "salary": _ld_salary(jp),
-                            "remote_eligible": "Yes" if "remote" in loc.lower() else "",
-                        }
-
-                        jl = jp.get("jobLocation", {})
-                        if isinstance(jl, dict):
-                            a = jl.get("address", {})
-                            if isinstance(a, dict):
-                                job["city"] = a.get("addressLocality", "")
-                                job["state"] = a.get("addressRegion", "")
-                                job["country"] = a.get("addressCountry", "")
-
-                        result = await db.insert_job(job)
-                        if csv_writer and result != "duplicate":
-                            await csv_writer(job)
-                        count += 1
-                except Exception:
-                    pass
+            except Exception:
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        count += page_count
+        if fetched_count == 0:
             break
-        except Exception:
-            if attempt < config.MAX_RETRIES - 1:
-                await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        pr += 1
+        if pr > 50:
+            break
+            
     return count
 
 
