@@ -94,69 +94,77 @@ async def _search_jibe_api(portal, keyword, domain_name, client, csv_writer) -> 
     count = 0
     api_url = portal["base"]
     company = portal["company"]
+    
+    offset = 0
+    while True:
+        page_count = 0
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                resp = await client.get(
+                    api_url, 
+                    params={"q": keyword, "limit": 100, "offset": offset},
+                    headers={"User-Agent": config.USER_AGENT, "Accept": "application/json"}
+                )
+                if resp.status_code != 200:
+                    break
 
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            resp = await client.get(
-                api_url, 
-                params={"q": keyword, "limit": 100},
-                headers={"User-Agent": config.USER_AGENT, "Accept": "application/json"}
-            )
-            if resp.status_code != 200:
+                data = resp.json()
+                jobs_list = data.get("jobs", [])
+                
+                for item in jobs_list:
+                    jp = item.get("data", {})
+                    if not jp:
+                        continue
+                        
+                    posted = jp.get("posted_date", "") or jp.get("update_date", "") or jp.get("create_date", "")
+                    if not is_recent(posted):
+                        continue
+                        
+                    loc = jp.get("full_location", "") or jp.get("location_name", "") or jp.get("city", "")
+
+                    desc = strip_html(jp.get("description", ""))
+                    url = jp.get("apply_url", "")
+                    if not url:
+                        # Construct URL if possible
+                        url = api_url.replace("/api/jobs", f"/jobs/{jp.get('slug','')}")
+                        
+                    job = {
+                        "domain": domain_name,
+                        "role_searched": keyword,
+                        "source_ats": "icims",
+                        "company": company,
+                        "job_id": jp.get("req_id", ""),
+                        "title": jp.get("title", ""),
+                        "job_url": url,
+                        "description": desc,
+                        "location": loc,
+                        "city": jp.get("city", ""),
+                        "state": jp.get("state", ""),
+                        "country": jp.get("country", ""),
+                        "department": jp.get("category", ""),
+                        "posted_date": posted,
+                        "employment_type": jp.get("employment_type", ""),
+                        "time_type": jp.get("employment_type", ""),
+                        "experience_level": extract_experience(desc) or "Not Specified",
+                        "company_logo": jp.get("hiring_organization_logo", ""),
+                        "remote_eligible": "Yes" if "remote" in loc.lower() else "",
+                    }
+
+                    result = await db.insert_job(job)
+                    if csv_writer and result != "duplicate":
+                        await csv_writer(job)
+                    page_count += 1
                 break
-
-            data = resp.json()
-            jobs_list = data.get("jobs", [])
-            
-            for item in jobs_list:
-                jp = item.get("data", {})
-                if not jp:
-                    continue
-                    
-                posted = jp.get("posted_date", "") or jp.get("update_date", "") or jp.get("create_date", "")
-                if not is_recent(posted):
-                    continue
-                    
-                loc = jp.get("full_location", "") or jp.get("location_name", "") or jp.get("city", "")
-                if not is_us_location(loc, jp.get("country", "")):
-                    continue
-
-                desc = strip_html(jp.get("description", ""))
-                url = jp.get("apply_url", "")
-                if not url:
-                    # Construct URL if possible
-                    url = api_url.replace("/api/jobs", f"/jobs/{jp.get('slug','')}")
-                    
-                job = {
-                    "domain": domain_name,
-                    "role_searched": keyword,
-                    "source_ats": "icims",
-                    "company": company,
-                    "job_id": jp.get("req_id", ""),
-                    "title": jp.get("title", ""),
-                    "job_url": url,
-                    "description": desc,
-                    "location": loc,
-                    "city": jp.get("city", ""),
-                    "state": jp.get("state", ""),
-                    "country": jp.get("country", ""),
-                    "department": jp.get("category", ""),
-                    "posted_date": posted,
-                    "employment_type": jp.get("employment_type", ""),
-                    "time_type": jp.get("employment_type", ""),
-                    "experience_level": extract_experience(desc) or "Not Specified",
-                    "company_logo": jp.get("hiring_organization_logo", ""),
-                    "remote_eligible": "Yes" if "remote" in loc.lower() else "",
-                }
-
-                result = await db.insert_job(job)
-                if csv_writer and result != "duplicate":
-                    await csv_writer(job)
-                count += 1
+            except Exception:
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        
+        count += page_count
+        if page_count == 0 or page_count < 100:
             break
-        except Exception:
-            if attempt < config.MAX_RETRIES - 1:
-                await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        offset += 100
+        if offset >= 2000:
+            break
     return count
 
 
@@ -164,37 +172,47 @@ async def _search_modern(portal, keyword, domain_name, client, csv_writer) -> in
     count = 0
     base, company = portal["base"], portal["company"]
 
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            resp = await client.get(
-                f"{base}/tile-search-results?q={keyword}&sortColumn=referencedate&sortDirection=desc&startrow=0",
-                headers={"User-Agent": config.USER_AGENT, "X-Requested-With": "XMLHttpRequest"},
-            )
-            if resp.status_code != 200:
+    startrow = 0
+    while True:
+        page_count = 0
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                resp = await client.get(
+                    f"{base}/tile-search-results?q={keyword}&sortColumn=referencedate&sortDirection=desc&startrow={startrow}",
+                    headers={"User-Agent": config.USER_AGENT, "X-Requested-With": "XMLHttpRequest"},
+                )
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                tiles = soup.find_all("li", class_=lambda c: c and "job-tile" in c)
+                for tile in tiles:
+                    job = _parse_tile(tile, base, domain_name, keyword, company)
+                    if not job:
+                        continue
+                    if not is_recent(job.get("posted_date", "")):
+                        continue
+
+                    job["experience_level"] = extract_experience(job.get("description", ""))
+                    if not job["experience_level"]:
+                        job["experience_level"] = "Not Specified"
+
+                    result = await db.insert_job(job)
+                    if csv_writer and result != "duplicate":
+                        await csv_writer(job)
+                    page_count += 1
                 break
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tile in soup.find_all("li", class_=lambda c: c and "job-tile" in c):
-                job = _parse_tile(tile, base, domain_name, keyword, company)
-                if not job:
-                    continue
-                if not is_recent(job.get("posted_date", "")):
-                    continue
-                if not is_us_location(job.get("location", "")):
-                    continue
-
-                job["experience_level"] = extract_experience(job.get("description", ""))
-                if not job["experience_level"]:
-                    job["experience_level"] = "Not Specified"
-
-                result = await db.insert_job(job)
-                if csv_writer and result != "duplicate":
-                    await csv_writer(job)
-                count += 1
+            except Exception:
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        
+        count += page_count
+        if page_count == 0:
             break
-        except Exception:
-            if attempt < config.MAX_RETRIES - 1:
-                await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        startrow += 20  # iCIMS typically uses 20 or 15. We advance by 20 to be safe
+        if startrow >= 1000:  # Safety cap
+            break
+            
     return count
 
 
@@ -202,70 +220,79 @@ async def _search_legacy(portal, keyword, domain_name, client, csv_writer) -> in
     count = 0
     base, company = portal["base"], portal["company"]
 
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            resp = await client.get(
-                f"{base}/jobs/search", params={"q": keyword, "in_iframe": 1},
-                headers={"User-Agent": config.USER_AGENT},
-            )
-            if resp.status_code != 200:
+    pr = 0
+    while True:
+        page_count = 0
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                resp = await client.get(
+                    f"{base}/jobs/search", params={"q": keyword, "in_iframe": 1, "pr": pr},
+                    headers={"User-Agent": config.USER_AGENT},
+                )
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for script in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        ld = json.loads(script.string)
+                        if not isinstance(ld, dict) or ld.get("@type") != "ItemList":
+                            continue
+                        for item in ld.get("itemListElement", []):
+                            jp = item.get("item", item)
+                            posted = jp.get("datePosted", "")
+                            if not is_recent(posted):
+                                continue
+                            loc = _ld_location(jp)
+
+                            org = jp.get("hiringOrganization", {})
+                            desc = strip_html(jp.get("description", ""))
+
+                            job = {
+                                "domain": domain_name,
+                                "role_searched": keyword,
+                                "source_ats": "icims",
+                                "company": org.get("name", company) if isinstance(org, dict) else company,
+                                "job_id": _ld_id(jp),
+                                "title": jp.get("title", jp.get("name", "")),
+                                "job_url": jp.get("url", ""),
+                                "description": desc,
+                                "location": loc,
+                                "posted_date": posted,
+                                "employment_type": jp.get("employmentType", ""),
+                                "time_type": jp.get("employmentType", ""),
+                                "experience_level": extract_experience(desc) or "Not Specified",
+                                "company_logo": org.get("logo", "") if isinstance(org, dict) else "",
+                                "salary": _ld_salary(jp),
+                                "remote_eligible": "Yes" if "remote" in loc.lower() else "",
+                            }
+
+                            jl = jp.get("jobLocation", {})
+                            if isinstance(jl, dict):
+                                a = jl.get("address", {})
+                                if isinstance(a, dict):
+                                    job["city"] = a.get("addressLocality", "")
+                                    job["state"] = a.get("addressRegion", "")
+                                    job["country"] = a.get("addressCountry", "")
+
+                            result = await db.insert_job(job)
+                            if csv_writer and result != "duplicate":
+                                await csv_writer(job)
+                            page_count += 1
+                    except Exception:
+                        pass
                 break
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    ld = json.loads(script.string)
-                    if not isinstance(ld, dict) or ld.get("@type") != "ItemList":
-                        continue
-                    for item in ld.get("itemListElement", []):
-                        jp = item.get("item", item)
-                        posted = jp.get("datePosted", "")
-                        if not is_recent(posted):
-                            continue
-                        loc = _ld_location(jp)
-                        if not is_us_location(loc):
-                            continue
-
-                        org = jp.get("hiringOrganization", {})
-                        desc = strip_html(jp.get("description", ""))
-
-                        job = {
-                            "domain": domain_name,
-                            "role_searched": keyword,
-                            "source_ats": "icims",
-                            "company": org.get("name", company) if isinstance(org, dict) else company,
-                            "job_id": _ld_id(jp),
-                            "title": jp.get("title", jp.get("name", "")),
-                            "job_url": jp.get("url", ""),
-                            "description": desc,
-                            "location": loc,
-                            "posted_date": posted,
-                            "employment_type": jp.get("employmentType", ""),
-                            "time_type": jp.get("employmentType", ""),
-                            "experience_level": extract_experience(desc) or "Not Specified",
-                            "company_logo": org.get("logo", "") if isinstance(org, dict) else "",
-                            "salary": _ld_salary(jp),
-                            "remote_eligible": "Yes" if "remote" in loc.lower() else "",
-                        }
-
-                        jl = jp.get("jobLocation", {})
-                        if isinstance(jl, dict):
-                            a = jl.get("address", {})
-                            if isinstance(a, dict):
-                                job["city"] = a.get("addressLocality", "")
-                                job["state"] = a.get("addressRegion", "")
-                                job["country"] = a.get("addressCountry", "")
-
-                        result = await db.insert_job(job)
-                        if csv_writer and result != "duplicate":
-                            await csv_writer(job)
-                        count += 1
-                except Exception:
-                    pass
+            except Exception:
+                if attempt < config.MAX_RETRIES - 1:
+                    await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        
+        count += page_count
+        if page_count == 0:
             break
-        except Exception:
-            if attempt < config.MAX_RETRIES - 1:
-                await asyncio.sleep(config.RETRY_BACKOFF * (attempt + 1))
+        pr += 1
+        if pr > 50:
+            break
+            
     return count
 
 
@@ -304,8 +331,6 @@ async def _search_custom(portal, keyword, domain_name, client, csv_writer) -> in
                         if not is_recent(posted):
                             continue
                         loc = _ld_location(jp)
-                        if not is_us_location(loc):
-                            continue
 
                         org = jp.get("hiringOrganization", {})
                         desc = strip_html(jp.get("description", ""))
@@ -421,4 +446,4 @@ async def process_portal(portal: Dict, search_pairs: List[tuple],
     if total > 0:
         log.info(f"  [iCIMS] {company}: {total} jobs ✅")
     else:
-        log.info(f"  [iCIMS] {company}: 0 recent US jobs")
+        log.info(f"  [iCIMS] {company}: 0 recent jobs")
