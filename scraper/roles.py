@@ -82,7 +82,6 @@ def fetch_roles() -> List[Dict]:
         data = resp.json()
 
         roles = []
-        skipped = 0
         total_terms = 0
 
         for item in data:
@@ -90,12 +89,7 @@ def fetch_roles() -> List[Dict]:
             if not raw_name:
                 continue
 
-            # Skip domains explicitly tagged for non-US countries
-            if _is_non_us_domain(raw_name):
-                skipped += 1
-                continue
-
-            # Clean the domain name (strip country suffixes)
+            # Clean the domain name for searching but keep raw_name for the domain column
             clean_name = _clean_role_name(raw_name)
             if not clean_name or len(clean_name) < 2:
                 continue
@@ -107,12 +101,10 @@ def fetch_roles() -> List[Dict]:
                 if alt_clean and len(alt_clean) > 1:
                     terms.add(alt_clean)
 
-            roles.append({"name": clean_name, "terms": list(terms)})
+            roles.append({"name": raw_name, "terms": list(terms)})
             total_terms += len(terms)
 
-        if skipped:
-            log.info(f"⏭️  Skipped {skipped} non-US country-specific domains")
-        log.info(f"✅ {len(roles)} US-relevant domains, {total_terms} search keywords loaded")
+        log.info(f"✅ {len(roles)} domains, {total_terms} search keywords loaded")
         return roles
 
     except Exception as e:
