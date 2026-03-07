@@ -9,7 +9,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # Max 2 hours as per spec
+    timeout-minutes: 1440   # Max 2 hours as per spec
 
     steps:
     - name: Checkout code
@@ -44,3 +44,4 @@ jobs:
         name: scraper-logs-${{ github.run_number }}
         path: scraper.log
         retention-days: 7
+
